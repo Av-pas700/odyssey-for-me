@@ -192,3 +192,20 @@ button { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
   .pref-row { font-size: 16px; }
   .pref-actions button { min-height: 48px; }
 }
+
+/* turn-by-turn */
+details.tbt {
+  margin-top: 10px; background: rgba(125, 211, 252, 0.06);
+  border: 1px solid var(--border); border-radius: 12px; padding: 9px 12px;
+}
+details.tbt summary {
+  cursor: pointer; font-family: inherit; font-weight: 700;
+  font-size: 12.5px; color: var(--accent);
+}
+details.tbt summary:hover { color: var(--accent); }
+details.tbt ol {
+  margin: 8px 0 4px; padding-left: 22px; font-size: 13px;
+  line-height: 1.75; color: var(--text);
+}
+details.tbt li::marker { color: var(--accent); font-family: inherit; font-weight: 700; }
+ { font-weight: 800; color: var(--accent); }

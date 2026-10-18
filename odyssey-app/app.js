@@ -302,6 +302,49 @@ function explain(route, altRoutes, crimes, havens, label) {
   return parts.slice(0, 3).join(" ");
 }
 
+/* Turn-by-turn for Athena's exact route — generated in-app so nothing
+   reroutes the path and no stop markers appear. Groups consecutive hops by
+   OSM street name; compass bearing from each group's chord. */
+function bearingDeg(a, b) {
+  const d2r = Math.PI / 180;
+  const la1 = a[0] * d2r, la2 = b[0] * d2r, dlo = (b[1] - a[1]) * d2r;
+  const y = Math.sin(dlo) * Math.cos(la2);
+  const x = Math.cos(la1) * Math.sin(la2) - Math.sin(la1) * Math.cos(la2) * Math.cos(dlo);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+function fmtDist(m) { return m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(1)} km`; }
+function turnByTurn(graph, route) {
+  if (!route.steps.length) return [{ text: "Start and destination are the same place", dist: 0 }];
+  const groups = [];
+  for (const st of route.steps) {
+    const segMeta = graph.byId.get(st.seg);
+    const WAY_NICE = { pedestrian: "pedestrian street", footway: "footpath",
+      cycleway: "cycle path", service: "service road", living_street: "living street" };
+    const name = (segMeta?.name && segMeta.name !== "unnamed path") ? segMeta.name :
+      (segMeta?.highway_type ? (WAY_NICE[segMeta.highway_type] || segMeta.highway_type.replace(/_/g, " ")) : "unnamed path");
+    const g = groups[groups.length - 1];
+    if (g && g.name === name) { g.dist += st.len; g.to = graph.nodes.get(st.to).c; }
+    else groups.push({ name, dist: st.len, from: graph.nodes.get(st.from).c, to: graph.nodes.get(st.to).c });
+  }
+  const out = []; let prevBr = null;
+  const COMPASS = ["north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west"];
+  for (const g of groups) {
+    const br = bearingDeg(g.from, g.to);
+    const dir = COMPASS[Math.round(br / 45) % 8];
+    let lead;
+    if (prevBr === null) lead = `Head ${dir} on`;
+    else {
+      const delta = ((br - prevBr + 540) % 360) - 180;
+      lead = Math.abs(delta) < 50 ? "Continue onto" : (delta > 0 ? "Turn right onto" : "Turn left onto");
+    }
+    out.push({ text: `${lead} ${g.name} — ${fmtDist(g.dist)}`, dist: g.dist });
+    prevBr = br;
+  }
+  out.push({ text: "Arrive at your destination", dist: 0 });
+  return out;
+}
+
+
 /* Douglas-Peucker polyline simplification (tolerance in degrees). */
 function dpSimplify(pts, tol) {
   if (pts.length < 3) return pts.slice();
@@ -337,6 +380,7 @@ function dpSimplify(pts, tol) {
    8 evenly spaced interior waypoints so Google follows the walked
    path instead of inventing its own. */
 function routeToGmapsUrl(graph, route) {
+  if (!route.steps.length) return "https://www.google.com/maps";
   const pts = [graph.nodes.get(route.steps[0].from).c]
     .concat(route.steps.map(st => graph.nodes.get(st.to).c));
   // merged LineString: drop consecutive duplicates
@@ -368,7 +412,7 @@ function routeToGmapsUrl(graph, route) {
 /* ----------------------------- exports -------------------------------- */
 if (typeof module !== "undefined") {
   module.exports = { buildGraph, snap, findRoute, routeStats, explain,
-                     routeToGmapsUrl, distM, PRESETS, PROFILES, MAX_EXTRA_MIN,
+                     routeToGmapsUrl, turnByTurn, distM, PRESETS, PROFILES, MAX_EXTRA_MIN,
                      dpSimplify, edgeMultiplier, explanationFactors,
                      DEFAULT_PREFS, loadPrefs,
                      planTriad };
@@ -376,6 +420,14 @@ if (typeof module !== "undefined") {
 
 /* ============================ browser UI =============================== */
 if (typeof document !== "undefined") (async function () {
+  const showErr = (label, err) => {
+    const el = document.getElementById("status");
+    if (el) el.textContent = `${label}: ${err && (err.message || err)}`;
+    console.error(label, err);
+  };
+  window.addEventListener("error", (e) => showErr("Error", e.error || e.message));
+  window.addEventListener("unhandledrejection", (e) => showErr("Async error", e.reason));
+
   const $ = (id) => document.getElementById(id);
   const load = (p) => fetch(p).then(r => r.json());
   const [segments, crimes, havens, model, liveSnapshot, manifest, basemap] = await Promise.all([
@@ -563,6 +615,13 @@ if (typeof document !== "undefined") (async function () {
 
   /* routing */
   const graph = buildGraph(segments);
+
+  /* demo mode: ?demo=1 auto-plans a real route (two verified points near
+     the University / Portswood). Useful for screenshots, pitch decks and
+     trying Odyssey without granting GPS. */
+  if (new URLSearchParams(location.search).get("demo") === "1") {
+    setTimeout(() => planRoute([50.9362, -1.39561], [50.92841, -1.39961], "Demo destination"), 0);
+  }
   let routeLayers = [];
   let routeLines = [], routeCards = [], selected = -1;
   let lastPlan = null;                    // for instant re-plan after prefs change
@@ -611,6 +670,10 @@ if (typeof document !== "undefined") (async function () {
       routesEl.innerHTML = "<p class='hint'>Start or destination is too far from the walking network — pick a point nearer a street or path.</p>";
       return;
     }
+    if (a.key === b.key) {
+      routesEl.innerHTML = "<p class='hint'>Start and destination are the same point — pick two different points on the map.</p>";
+      return;
+    }
     const prefs = loadPrefs();
     const triad = planTriad(graph, a.key, b.key, prefs);
     const results = [];
@@ -647,6 +710,9 @@ if (typeof document !== "undefined") (async function () {
         (r.route.explanation_factors.length ? `<div class="factor-chips">` +
           r.route.explanation_factors.map(f => `<span class="chip">${esc(f)}</span>`).join("") +
           `</div>` : "") +
+        `<details class="tbt"><summary>Turn-by-turn — Athena's exact route</summary><ol>` +
+        turnByTurn(graph, r.route).map(s => `<li>${esc(s.text)}</li>`).join("") +
+        `</ol></details>` +
         `<div class="route-actions">` +
         `<button class="choose" data-i="${idx}">Choose this route</button>` +
         `<a class="gmaps" target="_blank" href="${r.route.gmaps_url}">Open in Google Maps</a>` +
