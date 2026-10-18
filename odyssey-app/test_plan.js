@@ -180,6 +180,61 @@ console.log("improvement counts (better/equal/worse vs fastest, over 45 pairs):"
   check("uberUrl: explicit pickup when the start isn't GPS", /pickup\[latitude\]=50\.930000/.test(u2) && /dropoff\[nickname\]=Destination/.test(u2), u2);
 }
 
+/* ---- 7. step-by-step directions and the Google Maps handoff ---- */
+{
+  const RAW_TAGS = /\b(tertiary|secondary|primary|residential|unclassified|footway|cycleway|living_street)\b/;   // raw map tags must not leak into the text
+  const ll = (c) => `${c[0].toFixed(5)},${c[1].toFixed(5)}`;
+  const sum = { 0: [0, 0], 3: [0, 0], 9: [0, 0], n: 0 };   // [stops, simulated match %] per stop budget
+  let badTbt = 0, badUrl = 0, badStopPos = 0, firstBad = "";
+  for (const p of pairs) {
+    const plan = core.planRoutes(graph, p.a, p.b, {}, {});
+    if (!plan.ok) continue;
+    for (const r of plan.routes) {
+      sum.n++;
+      // directions
+      const t = core.turnByTurn(graph, r.route);
+      const body = t.slice(0, -1);
+      const covered = t.reduce((x, y) => x + y.dist, 0);
+      const ok = t.length >= 2 && /^Head (north|north-east|east|south-east|south|south-west|west|north-west) on /.test(t[0].text) &&
+        t[t.length - 1].text === "Arrive at your destination" && Math.abs(covered - r.route.chainLen) < 1 &&
+        body.every(x => x.name && x.lead && (x.dist >= 15 || /steps/.test(x.name))) && !t.some(x => RAW_TAGS.test(x.text));
+      if (!ok) { badTbt++; firstBad = firstBad || `${p.name}: ${t.map(x => x.text).join(" | ")}`; }
+      // Google link with 0, 3 and 9 stops
+      const nodes = new Set([r.route.steps[0].from].concat(r.route.steps.map(s => s.to)));
+      const nodePts = new Set([...nodes].map(k => ll(graph.nodes.get(k).c)));
+      for (const k of [0, 3, 9]) {
+        const hnd = core.gmapsHandoff(graph, r.route, null, null, { maxStops: k });
+        const u = new URL(hnd.url), wp = u.searchParams.get("waypoints"), cnt = wp ? wp.split("|").length : 0;
+        const pipesOk = wp ? !hnd.url.includes("|") && (cnt < 2 || hnd.url.includes("%7C")) : !hnd.url.includes("waypoints");
+        if (cnt > k || cnt !== hnd.stops.length || hnd.url.length > 2048 || u.searchParams.get("travelmode") !== "walking" || !pipesOk) badUrl++;
+        if (hnd.stops.some(c => !nodePts.has(ll(c)))) badStopPos++;
+        sum[k][0] += hnd.stops.length; sum[k][1] += hnd.matchPct;
+      }
+    }
+  }
+  check(`directions: all ${sum.n} routes well-formed (start, arrival, distances add up, no tiny or raw-tag lines)`, badTbt === 0, `${badTbt} bad; first: ${firstBad}`);
+  check(`Google link: 0, 3 and 9 stop budgets are respected, valid and short enough on all ${sum.n} routes`, badUrl === 0, `${badUrl} bad`);
+  check("Google link: every stop sits on a point of the route", badStopPos === 0, `${badStopPos} bad`);
+  const avg = (k) => sum[k][1] / sum.n;
+  console.log(`google stops: none ${avg(0).toFixed(1)}% of the route reproduced (simulated); up to 3 stops ${avg(3).toFixed(1)}% (avg ${(sum[3][0] / sum.n).toFixed(2)} stops); up to 9 stops ${avg(9).toFixed(1)}% (avg ${(sum[9][0] / sum.n).toFixed(2)} stops)`);
+  check("Google link: stops raise the simulated match (none < 3 stops <= 9 stops)", avg(0) < avg(3) && avg(3) <= avg(9));
+  check("Google link: 3 stops reproduce at least 90% of the route on average", avg(3) >= 90, avg(3).toFixed(1));
+  check("Google link: 9 stops reproduce at least 97% of the route on average", avg(9) >= 97, avg(9).toFixed(1));
+
+  // the person's own start and end are used, same-place and empty routes are safe
+  const plan0 = core.planRoutes(graph, pairs[3].a, pairs[3].b, {}, {});
+  const own = core.gmapsHandoff(graph, plan0.routes[0].route, [50.91, -1.41], [50.93, -1.39], { maxStops: 3 });
+  const q = new URL(own.url).searchParams;
+  check("Google link: uses the person's own start and destination when given", q.get("origin") === "50.91000,-1.41000" && q.get("destination") === "50.93000,-1.39000", own.url);
+  const none = core.gmapsHandoff(graph, { steps: [], chainLen: 0 }, null, null, {});
+  check("Google link: empty route -> plain Google Maps, no crash", none.url === "https://www.google.com/maps" && none.stops.length === 0);
+  const same = core.turnByTurn(graph, { steps: [], chainLen: 0 });
+  check("directions: empty route -> says start and destination are the same place", same.length === 1 && /same place/.test(same[0].text));
+  const t0 = Date.now();
+  for (const p of pairs.slice(0, 10)) core.gmapsHandoff(graph, core.planRoutes(graph, p.a, p.b, {}, {}).routes[0].route, null, null, { maxStops: 9 });
+  check("Google link: finding 9 stops stays quick (10 routes under 3 s including planning)", Date.now() - t0 < 3000, `${Date.now() - t0} ms`);
+}
+
 console.log(`${checks} checks, ${fails} failed`);
 console.log(fails ? "\nFAILED" : "\nALL TESTS PASSED");
 process.exit(fails ? 1 : 0);

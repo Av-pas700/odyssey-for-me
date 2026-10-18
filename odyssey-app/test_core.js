@@ -71,12 +71,23 @@ for (const [name, from, to, maxKm] of trips) {
     if (!uniq.some(u => u.route.segments.map(s=>s.id).join() === r.route.segments.map(s=>s.id).join())) uniq.push(r);
   for (const r of uniq.slice(0, 2))
     console.log(`  [${r.label}] "${core.explain(r.route, uniq, crimes, havens, r.label)}"`);
-  const url = core.routeToGmapsUrl(graph, uniq[0].route);
-  console.log(`  gmaps: hops=${uniq[0].route.steps.length} stops=0`, url.slice(0, 90) + "…");
-  if (url.includes("waypoints=")) { console.log("  !! waypoints present — Google would show stops"); fail++; }
-  if (!url.includes("travelmode=walking")) { console.log("  !! missing travelmode=walking"); fail++; }
-  const stops = (url.match(/%7C/g) || []).length;
-  if (stops) { console.log(`  !! ${stops} pipe-separated stops in URL`); fail++; }
+  const tbt = core.turnByTurn(graph, uniq[0].route);
+  console.log(`  tbt: ${tbt.length} steps; first: "${tbt[0].text}"`);
+  if (tbt.length < 3) { console.log("  !! suspiciously few steps"); fail++; }
+  if (!/^Head (north|north-east|east|south-east|south|south-west|west|north-west) on .+ — \d/.test(tbt[0].text)) { console.log("  !! first step malformed"); fail++; }
+  if (tbt[tbt.length - 1].text !== "Arrive at your destination") { console.log("  !! missing arrival step"); fail++; }
+  const covered = tbt.reduce((s, x) => s + x.dist, 0);
+  if (Math.abs(covered - uniq[0].route.chainLen) > 1) { console.log(`  !! tbt distance ${covered.toFixed(0)} != route ${uniq[0].route.chainLen.toFixed(0)}`); fail++; }
+  if (new Set(tbt.map(x => x.text)).size < 3) { console.log("  !! no street variety"); fail++; }
+  // Google link: the fewest stops that keep Google on our route (3 max on a phone browser, 9 elsewhere)
+  for (const budget of [3, 9]) {
+    const url = core.routeToGmapsUrl(graph, uniq[0].route, null, null, { maxStops: budget });
+    const wps = (url.match(/waypoints=([^&]*)/)?.[1] || "").split("%7C").filter(Boolean);
+    console.log(`  gmaps (up to ${budget}): hops=${uniq[0].route.steps.length} waypoints=${wps.length}`, url.slice(0, 80) + "…");
+    if (wps.length > budget) { console.log(`  !! more than ${budget} waypoints`); fail++; }
+    if (url.length > 2048) { console.log("  !! URL longer than Google's 2,048-character limit"); fail++; }
+    if (!url.includes("travelmode=walking")) { console.log("  !! missing travelmode=walking"); fail++; }
+  }
 }
 // ---- route data fields used by the preference buttons ----
 console.log("\n== preference data ==");

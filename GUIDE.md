@@ -117,7 +117,7 @@ fake-precise percentages, because "87% safe" would be a lie.
 - Preset destinations or click-anywhere trip planning
 - Safest / Shortest / Balanced comparison cards
 - Plain-English explanations per route
-- One-tap handoff to Google Maps as a single continuous route (walking, no intermediate stops)
+- One-tap handoff to Google Maps with the fewest stops that keep Google on Athena's path (3 in a phone browser, 9 elsewhere), plus a step-by-step list in the app
 - "Report this route" (saved on the device; with no backend it stays local,
   and the app says so)
 - SOS overlay: call 999, call 101, copy my location
@@ -167,7 +167,7 @@ Athena's risk model is **trained by the pipeline on the real crime data**:
 logistic regression over 19 features (lighting, highway type, isolation,
 tide exposure, nightlife density, distance to 24/7 venues, lagged crime
 counts). Trained on months up to Jul 2026, evaluated on the held-out month
-Aug 2026: **AUC 0.971**, against a baseline that predicts from last month's
+Aug 2026: **AUC 0.982**, against a baseline that predicts from last month's
 crime alone (**AUC 0.866**). Remove the model and the product has no scores,
 no safest routing, no explanations — that's AI at the core, with the baseline
 comparison the brief asks for.

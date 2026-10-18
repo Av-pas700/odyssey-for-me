@@ -695,20 +695,153 @@ function explain(route, altRoutes, crimes, havens, label) {
   return parts.slice(0, 5).join(" ");
 }
 
-/* Google Maps handoff (from the original project): origin and destination only,
- * travelmode=walking. Google draws one continuous route with no intermediate
- * stops; our chosen path stays visible in the app. Pass origin/dest ([lat, lng])
- * to use the person's real start and destination; otherwise the route's own
- * first and last points are used. */
-function routeToGmapsUrl(graph, route, origin, dest) {
-  const first = origin || graph.nodes.get(route.steps[0].from).c;
-  const last = dest || graph.nodes.get(route.steps[route.steps.length - 1].to).c;
-  const ll = c => `${c[0].toFixed(5)},${c[1].toFixed(5)}`;
-  const q = new URLSearchParams({
-    api: 1, origin: ll(first), destination: ll(last), travelmode: "walking",
-  });
-  return "https://www.google.com/maps/dir/?" + q.toString();
+/* ---- Step-by-step directions for the route we chose --------------------
+ * Built in the app from our own route, so nothing is rerouted. Hops are grouped
+ * by street name; unnamed ways get a plain name ("the footpath"), tiny hops are
+ * folded into their neighbours, and turns are judged from the walking
+ * direction just before and just after each junction (not the whole chord). */
+function bearingDeg(a, b) {
+  const d2r = Math.PI / 180;
+  const la1 = a[0] * d2r, la2 = b[0] * d2r, dlo = (b[1] - a[1]) * d2r;
+  const y = Math.sin(dlo) * Math.cos(la2);
+  const x = Math.cos(la1) * Math.sin(la2) - Math.sin(la1) * Math.cos(la2) * Math.cos(dlo);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
 }
+function fmtDist(m) { return m < 1000 ? `${Math.round(m / 5) * 5 || Math.round(m)} m` : `${(m / 1000).toFixed(1)} km`; }
+
+const WAY_NAME = { pedestrian: "the pedestrian street", footway: "the footpath", path: "the path",
+  cycleway: "the cycle path", service: "the service road", living_street: "the road", track: "the track",
+  steps: "the steps", corridor: "the passage", bridleway: "the bridleway" };
+const wayName = (seg) => {
+  const n = seg && seg.name;
+  if (n && n !== "unnamed path") return { name: n, generic: false, steps: seg.highway_type === "steps" };
+  const t = seg && seg.highway_type;
+  return { name: WAY_NAME[t] || "the road", generic: true, steps: t === "steps" };
+};
+const COMPASS = ["north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west"];
+const TBT_TINY_M = 15, TBT_LOOK_M = 20;
+
+function turnByTurn(graph, route) {
+  if (!route || !route.steps.length) return [{ lead: "", name: "", dist: 0, text: "Start and destination are the same place" }];
+  // 1. one group per run of hops with the same name
+  let groups = [];
+  for (const st of route.steps) {
+    const w = wayName(graph.byId.get(st.seg));
+    const c0 = graph.nodes.get(st.from).c, c1 = graph.nodes.get(st.to).c;
+    const g = groups[groups.length - 1];
+    if (g && g.name === w.name && g.steps === w.steps) { g.dist += st.len; g.pts.push(c1); }
+    else groups.push({ name: w.name, generic: w.generic, steps: w.steps, dist: st.len, pts: [c0, c1] });
+  }
+  // 2. fold tiny non-step groups into a neighbour, then re-merge equal names
+  const fold = () => {
+    for (let i = 0; i < groups.length && groups.length > 1; i++) {
+      const g = groups[i];
+      if (g.dist >= TBT_TINY_M || g.steps) continue;
+      const into = i > 0 ? groups[i - 1] : groups[i + 1];
+      if (i > 0) { into.dist += g.dist; into.pts = into.pts.concat(g.pts.slice(1)); }
+      else { into.dist += g.dist; into.pts = g.pts.slice(0, -1).concat(into.pts); }
+      groups.splice(i, 1); return true;
+    }
+    return false;
+  };
+  while (fold()) { /* repeat until nothing tiny is left */ }
+  const merged = [];
+  for (const g of groups) {
+    const p = merged[merged.length - 1];
+    if (p && p.name === g.name && p.steps === g.steps) { p.dist += g.dist; p.pts = p.pts.concat(g.pts.slice(1)); }
+    else merged.push(g);
+  }
+  // 3. walking direction just after the start of a group / just before its end
+  const pathLen = (pts, i, j) => { let d = 0; for (let k = i; k < j; k++) d += distM(pts[k], pts[k + 1]); return d; };
+  const dirOut = (g) => { let j = 1; while (j < g.pts.length - 1 && pathLen(g.pts, 0, j) < TBT_LOOK_M) j++; return bearingDeg(g.pts[0], g.pts[j]); };
+  const dirIn = (g) => { const n = g.pts.length - 1; let i = n - 1; while (i > 0 && pathLen(g.pts, i, n) < TBT_LOOK_M) i--; return bearingDeg(g.pts[i], g.pts[n]); };
+  const out = [];
+  merged.forEach((g, i) => {
+    let lead;
+    if (g.steps) lead = "Take";
+    else if (i === 0) lead = `Head ${COMPASS[Math.round(dirOut(g) / 45) % 8]} on`;
+    else {
+      const delta = ((dirOut(g) - dirIn(merged[i - 1]) + 540) % 360) - 180, a = Math.abs(delta);
+      const side = delta > 0 ? "right" : "left";
+      lead = a < 30 ? "Continue onto" : a < 60 ? `Bear ${side} onto` : a < 135 ? `Turn ${side} onto` : `Turn sharp ${side} onto`;
+    }
+    out.push({ lead, name: g.name, dist: g.dist, text: `${lead} ${g.name} — ${fmtDist(g.dist)}` });
+  });
+  out.push({ lead: "", name: "", dist: 0, text: "Arrive at your destination" });
+  return out;
+}
+
+/* ---- Handing the route to Google Maps ----------------------------------
+ * Google's link takes a start, an end and a few stops, and then picks its own
+ * path between them, so two pins alone often give a different walk. We add the
+ * fewest stops that make Google's likely path match ours: pretend Google takes
+ * the shortest walk between the points (our own street map stands in for
+ * Google's), find where that pretend route leaves ours, and pin the middle of
+ * the longest stretch that is off. Repeat until it matches or the stop budget
+ * is used. Google allows 3 stops in a phone browser and 9 elsewhere. */
+const GMAPS_STOPS_PHONE = 3, GMAPS_STOPS_DESKTOP = 9, GMAPS_MIN_OFF_M = 50;
+const onPhoneBrowser = () => typeof navigator !== "undefined" &&
+  (/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "") ||
+   (navigator.maxTouchPoints > 1 && /Mac/i.test(navigator.platform || "")));
+
+function gmapsHandoff(graph, route, origin, dest, opts) {
+  opts = opts || {};
+  const maxStops = opts.maxStops ?? (onPhoneBrowser() ? GMAPS_STOPS_PHONE : GMAPS_STOPS_DESKTOP);
+  if (!route || !route.steps.length) return { url: "https://www.google.com/maps", stops: [], matchPct: 100, complete: true, maxStops };
+  if (!graph.attrs) attachExtras(graph, null);
+  const steps = route.steps;
+  const nodes = [steps[0].from].concat(steps.map(s => s.to));
+  const cum = [0];
+  for (const s of steps) cum.push(cum[cum.length - 1] + s.len);
+  const table = graph._plainTable || (graph._plainTable = buildCostTable(graph, FASTEST_W, 0));
+  const legs = new Map();
+  const leg = (a, b) => {
+    const k = a + ">" + b;
+    if (!legs.has(k)) legs.set(k, a === b ? null : searchRoute(graph, a, b, table, 0));
+    return legs.get(k);
+  };
+  // how much of our route would a "shortest walk between the points" reproduce?
+  const evaluate = (idx) => {
+    const pts = [0].concat(idx, [nodes.length - 1]), theirs = new Set();
+    for (let k = 0; k < pts.length - 1; k++) {
+      const r = leg(nodes[pts[k]], nodes[pts[k + 1]]);
+      if (r) for (const s of r.steps) theirs.add(edgeKey(s));
+    }
+    let match = 0, run = null, worst = null;
+    steps.forEach((s, i) => {
+      if (theirs.has(edgeKey(s))) { match += s.len; run = null; return; }
+      if (!run) run = { a: i, b: i, len: 0 };
+      run.b = i; run.len += s.len;
+      if (!worst || run.len > worst.len) worst = run;
+    });
+    return { match, worst };
+  };
+  const stops = [];
+  let ev = evaluate(stops);
+  while (stops.length < maxStops && ev.worst && ev.worst.len >= GMAPS_MIN_OFF_M) {
+    const mid = (cum[ev.worst.a] + cum[ev.worst.b + 1]) / 2;
+    let pick = -1;
+    for (let i = ev.worst.a; i <= ev.worst.b + 1; i++) {
+      if (i === 0 || i === nodes.length - 1 || stops.includes(i)) continue;
+      if (pick < 0 || Math.abs(cum[i] - mid) < Math.abs(cum[pick] - mid)) pick = i;
+    }
+    if (pick < 0) break;
+    stops.push(pick); stops.sort((x, y) => x - y);
+    ev = evaluate(stops);
+  }
+  const ll = (c) => `${c[0].toFixed(5)},${c[1].toFixed(5)}`;
+  const stopLL = stops.map(i => graph.nodes.get(nodes[i]).c);
+  const q = new URLSearchParams({
+    api: "1", origin: ll(origin || graph.nodes.get(nodes[0]).c),
+    destination: ll(dest || graph.nodes.get(nodes[nodes.length - 1]).c), travelmode: "walking",
+  });
+  if (stopLL.length) q.set("waypoints", stopLL.map(ll).join("|"));
+  return { url: "https://www.google.com/maps/dir/?" + q.toString(), stops: stopLL, maxStops,
+    matchPct: Math.round(100 * ev.match / Math.max(route.chainLen, 1)),
+    complete: !ev.worst || ev.worst.len < GMAPS_MIN_OFF_M };
+}
+/* Origin and destination ([lat, lng]) are the person's own points when given. */
+function routeToGmapsUrl(graph, route, origin, dest, opts) { return gmapsHandoff(graph, route, origin, dest, opts).url; }
 // older call shape, kept so existing callers keep working
 const gmapsUrl = (route, origin, dest, graph) => routeToGmapsUrl(graph, route, origin, dest);
 
@@ -716,13 +849,23 @@ const gmapsUrl = (route, origin, dest, graph) => routeToGmapsUrl(graph, route, o
 if (typeof module !== "undefined") {
   module.exports = { buildGraph, snap, findRoute, routeStats, explain,
                      gmapsUrl, distM, PRESETS, PROFILES, MAX_EXTRA_MIN,
-                     planTriad, routeToGmapsUrl, etaTime, attachExtras, segmentAttrs, buildWeights, buildCostTable,
+                     planTriad, routeToGmapsUrl, gmapsHandoff, turnByTurn, etaTime, attachExtras, segmentAttrs, buildWeights, buildCostTable,
                      searchRoute, analyseRoute, buildReport, planRoutes, routeDistance,
                      countTurns, ROUTE_LABELS, SOON_IDS, DEFAULT_EXTRA_MIN };
 }
 
 /* ============================ browser UI =============================== */
 if (typeof document !== "undefined") (async function () {
+  const showErr = (label, err) => {
+    const msg = String(err && (err.message || err));
+    console.error(label, err);
+    if (/ResizeObserver|Script error/i.test(msg)) return;      // harmless browser noise
+    const el = document.getElementById("status");
+    if (el) el.textContent = `${label}: ${msg}`;
+  };
+  window.addEventListener("error", (e) => showErr("Error", e.error || e.message));
+  window.addEventListener("unhandledrejection", (e) => showErr("Async error", e.reason));
+
   const $ = (id) => document.getElementById(id);
   // "no-cache" = always check with the server (a cheap 304 if unchanged), so a
   // browser never keeps showing an older data build after the data is updated
@@ -1001,14 +1144,15 @@ if (typeof document !== "undefined") (async function () {
       : "No street crimes were recorded on or near this route in the last 3 months.";
     kids.push(h("p", {}, crime));
     kids.push(h("p", {}, `Athena's risk bands by distance: ${pctOf(m.band.low, L)} lower, ${pctOf(m.band.medium, L)} medium, ` +
-      `${pctOf(m.band.high, L)} higher, ${pctOf(m.band.unknown, L)} not scored. Bands are relative to other streets, ` +
-      "and not scored doesn't mean safe."));
+      `${pctOf(m.band.high, L)} higher, ${pctOf(m.band.unknown, L)} not scored. Bands are relative to other streets, and a street is ` +
+      "rated medium or higher only if crimes were also recorded on it recently. Not scored doesn't mean safe."));
     kids.push(h("p", { class: "hint" }, "Counts cover whole streets, aren't live, and don't show time of day."));
     if (m.tideM > 0) kids.push(h("p", {}, "Part of this route is near tidal water, where low-lying paths can flood at high tide."));
     if (dataBuilt) kids.push(h("p", { class: "hint" }, `Map data built ${dataBuilt}.`));
     return h("details", { class: "info-block" }, ...kids);
   }
 
+  const handoffQueue = [];       // Google stop-finding jobs, run after the cards are drawn
   function buildCard(r, idx, c) {
     const m = r.metrics;
     const extra = r.role === "fastest" ? "" : (Math.round(r.extraMin) >= 1 ? ` · +${Math.round(r.extraMin)} min vs fastest` : " · same time as fastest");
@@ -1023,15 +1167,35 @@ if (typeof document !== "undefined") (async function () {
       if (reasons.length) {
         card.append(window.OdysseyRides.banner(reasons, (e) => window.OdysseyRides.openSheet({
           from: c.fromLL, to: c.toLL, destName: c.destName, fromIsGps: c.fromIsGps,
-          shareUrl: gmapsUrl(r.route, c.fromLL, c.toLL, graph),
+          shareUrl: gmapsHandoff(graph, r.route, c.fromLL, c.toLL).url,
         })));
       }
     }
+    // Google link: starts as plain start + end, then gets its stops a moment later
+    // (finding them takes a few searches, so the card appears first).
+    const gm = h("a", { class: "gmaps", target: "_blank", rel: "noopener noreferrer",
+      href: routeToGmapsUrl(graph, r.route, c.fromLL, c.toLL, { maxStops: 0 }) }, "Open in Google Maps");
+    const gmNote = h("p", { class: "hint gm-note" }, "");
+    handoffQueue.push(() => {
+      const hand = gmapsHandoff(graph, r.route, c.fromLL, c.toLL);
+      gm.href = hand.url;
+      const n = hand.stops.length;
+      gmNote.textContent = !hand.complete
+        ? `Opens Google Maps with ${n} stop${n === 1 ? "" : "s"}. A phone browser allows only ${hand.maxStops}, so parts of the walk may differ. Use the step-by-step list.`
+        : n ? `Opens Google Maps with ${n} stop${n === 1 ? "" : "s"} to keep it on this route. Google picks the exact path between stops, so it can still differ a little.`
+        : "Opens Google Maps. Its own route should match this one, but it can still differ a little.";
+    });
+    const steps = turnByTurn(graph, r.route);
     card.append(infoBlock(r),
+      h("details", { class: "tbt" },
+        h("summary", {}, `Step-by-step directions (${steps.length - 1} steps)`),
+        h("ol", {}, ...steps.map(st => h("li", {}, `${st.lead} ${st.name}`.trim() || st.text,
+          st.dist ? h("span", { class: "tbt-d" }, ` — ${fmtDist(st.dist)}`) : null)))),
       h("div", { class: "route-actions" },
         h("button", { class: "choose", "data-i": String(idx) }, "Choose this route"),
-        h("a", { class: "gmaps", target: "_blank", rel: "noopener noreferrer", href: gmapsUrl(r.route, c.fromLL, c.toLL, graph) }, "Open in Google Maps"),
+        gm,
         h("button", { class: "report", "data-i": String(idx) }, "Report this route")),
+      gmNote,
       h("p", { class: "report-msg hidden", id: `msg-${idx}` },
         "Thanks. Saved on this device only; nothing is sent anywhere."));
     return card;
@@ -1039,6 +1203,7 @@ if (typeof document !== "undefined") (async function () {
 
   async function planRoute(fromLL, toLL, destName, fromIsGps, relaxHard) {
     clearRouteLayers();
+    handoffQueue.length = 0;
     lastPlan = { fromLL, toLL, destName, fromIsGps, relaxHard: !!relaxHard };
     const routesEl = $("routes");
     routesEl.classList.remove("hidden");
@@ -1050,6 +1215,10 @@ if (typeof document !== "undefined") (async function () {
     const a = snap(graph, fromLL), b = snap(graph, toLL);
     if (a.dist > 400 || b.dist > 400) {
       routesEl.replaceChildren(h("p", { class: "hint" }, "Start or destination is too far from the walking network — pick a point nearer a street or path."));
+      return;
+    }
+    if (a.key === b.key) {
+      routesEl.replaceChildren(h("p", { class: "hint" }, "Start and destination are the same point. Pick two different points on the map."));
       return;
     }
     const prefs = window.OdysseyQuestionnaire ? window.OdysseyQuestionnaire.getPrefs() : null;
@@ -1089,6 +1258,12 @@ if (typeof document !== "undefined") (async function () {
     });
     selectRoute(0);
     map.fitBounds(L.featureGroup(routeLines).getBounds(), { padding: [40, 40] });
+    // add the Google stops one card at a time, so the page stays responsive
+    const runHandoffs = () => {
+      const job = handoffQueue.shift();
+      if (job) setTimeout(() => { job(); runHandoffs(); }, 0);
+    };
+    runHandoffs();
 
     routesEl.querySelectorAll(".choose").forEach(btn =>
       btn.addEventListener("click", () => selectRoute(+btn.dataset.i)));
@@ -1153,4 +1328,12 @@ if (typeof document !== "undefined") (async function () {
     $("sos-overlay").classList.remove("hidden");
   });
   $("sos-close").addEventListener("click", () => $("sos-overlay").classList.add("hidden"));
+
+  /* demo mode: ?demo=1 plans a real route between two points near the University
+   * and Portswood, with the default preferences, so the app can be tried (or
+   * screenshotted) without GPS or typing. */
+  if (new URLSearchParams(location.search).get("demo") === "1") {
+    setStatus("Demo mode: a sample walk starting near the University of Southampton (Highfield).");
+    planRoute([50.9362, -1.39561], [50.92841, -1.39961], "Demo destination", false);
+  }
 })();

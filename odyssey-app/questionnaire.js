@@ -346,7 +346,8 @@
     const gear = document.getElementById("prefs-open");
     if (gear) gear.addEventListener("click", () => open("settings"));
     const skipped = session && safe(() => session.getItem(SKIP_KEY)) === "1";
-    if (!savedOnDevice && !skipped) open("wizard");
+    const demo = /[?&]demo=1(&|$)/.test(location.search);       // ?demo=1 skips the first-run screen
+    if (!savedOnDevice && !skipped && !demo) open("wizard");
   }
 
   window.OdysseyQuestionnaire = {

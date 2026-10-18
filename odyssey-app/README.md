@@ -29,14 +29,21 @@ http://localhost:8000. No backend, no accounts, no keys.
   no public pre-fill link) and a share link (`rides.js`). No keys or server.
 - **Live:** the panel fetches the real-time Environment Agency tide gauge at
   Woolston and active flood warnings directly in your browser.
-- **Handoff:** one tap opens a single continuous route in Google Maps (origin to destination, walking) — no intermediate stops.
+- **Step-by-step directions:** each route card has a list built from our own route (street names, turns,
+  stairs, distances), so nothing is rerouted. Unnamed ways are called "the footpath" and so on.
+- **Google Maps handoff:** Google picks its own path between the points you give it, so two pins alone often
+  differ from our route. The link adds the fewest stops that keep Google on our route (we pretend Google takes
+  the shortest walk, find where that leaves our route, and pin the middle of the longest gap, repeating). Google
+  allows 3 stops in a phone browser and 9 elsewhere. The match is simulated on our own street map, not on
+  Google, so it can still differ a little; the card says so.
+- **Demo:** open the app with `?demo=1` to plan a sample walk without GPS or typing.
 - **SOS:** 999 / 101 dial buttons, copy-my-location, official guidance links.
 - **Tests:** `node test_plan.js` checks the planner (all 45 preset pairs under
   20 button combinations), the preferences and the ride rules; run both from
   this folder.
 - **Honesty:** `node test_core.js` verifies routes on the real data;
   `data/data_manifest.json` lists every source with its licence and fetch
-  date; `data/model.json` is the full model card (AUC 0.971 vs 0.866
+  date; `data/model.json` is the full model card (AUC 0.982 vs 0.866
   recency baseline on held-out Aug 2026).
 
 Regenerate all data + retrain the model: see `../odyssey-city-data`.
